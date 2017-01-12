@@ -17,8 +17,8 @@
 
 """LVAP Connection."""
 
-import tornado.ioloop
 import time
+import tornado.ioloop
 
 from construct import Container
 
@@ -152,9 +152,9 @@ class LVAPPConnection(object):
         except Exception as ex:
             LOG.exception(ex)
             self.stream.close()
-            return
 
-        self._wait()
+        if not self.stream.closed():
+            self._wait()
 
     def _trigger_message(self, msg_type):
 
@@ -166,31 +166,32 @@ class LVAPPConnection(object):
         if self.server.pt_types[msg_type]:
 
             msg = self.server.pt_types[msg_type].parse(self.__buffer)
+            addr = EtherAddress(msg.wtp)
+
+            try:
+                wtp = RUNTIME.wtps[addr]
+            except KeyError:
+                LOG.error("Unknown WTP (%s), closing connection", addr)
+                self.stream.close()
+                return
+
             handler_name = "_handle_%s" % self.server.pt_types[msg_type].name
 
             if hasattr(self, handler_name):
                 handler = getattr(self, handler_name)
-                handler(msg)
+                handler(wtp, msg)
 
         if msg_type in self.server.pt_types_handlers:
             for handler in self.server.pt_types_handlers[msg_type]:
                 handler(msg)
 
-    def _handle_hello(self, hello):
+    def _handle_hello(self, wtp, hello):
         """Handle an incoming HELLO message.
         Args:
             hello, a HELLO message
         Returns:
             None
         """
-
-        wtp_addr = EtherAddress(hello.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Hello from unknown WTP (%s)", wtp_addr)
-            return
 
         LOG.info("Hello from %s WTP %s seq %u", self.addr[0], wtp.addr,
                  hello.seq)
@@ -218,7 +219,7 @@ class LVAPPConnection(object):
                 continue
 
             # wtp not in this tenant
-            if wtp_addr not in tenant.wtps:
+            if wtp.addr not in tenant.wtps:
                 continue
 
             tenant_id = tenant.tenant_id
@@ -238,7 +239,7 @@ class LVAPPConnection(object):
                 self.send_add_vap(vap)
                 RUNTIME.tenants[tenant_id].vaps[net_bssid] = vap
 
-    def _handle_probe_request(self, request):
+    def _handle_probe_request(self, wtp, request):
         """Handle an incoming PROBE_REQUEST message.
         Args:
             request, a PROBE_REQUEST message
@@ -246,16 +247,13 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(request.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Probe request from unknown WTP (%s)", wtp_addr)
+        if not wtp.connection:
+            LOG.info("Probe request from disconnected WTP %s", wtp.addr)
+            self.stream.close()
             return
 
-        if not wtp.connection:
-            LOG.info("Probe request from disconnected WTP %s", wtp_addr)
+        if not wtp.port():
+            LOG.info("WTP %s not ready", wtp.addr)
             return
 
         sta = EtherAddress(request.sta)
@@ -283,7 +281,7 @@ class LVAPPConnection(object):
             if tenant.bssid_type == T_TYPE_SHARED:
                 continue
             for wtp_in_tenant in tenant.wtps.values():
-                if wtp_addr == wtp_in_tenant.addr:
+                if wtp.addr == wtp_in_tenant.addr:
                     ssids.add(tenant.tenant_name)
 
         if not ssids:
@@ -325,7 +323,7 @@ class LVAPPConnection(object):
         LOG.info("Sending probe response to %s", lvap.addr)
         self.send_probe_response(lvap)
 
-    def _handle_auth_request(self, request):
+    def _handle_auth_request(self, wtp, request):
         """Handle an incoming AUTH_REQUEST message.
         Args:
             request, a AUTH_REQUEST message
@@ -333,16 +331,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(request.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Auth request from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("Auth request from disconnected WTP %s", wtp_addr)
+            LOG.info("Auth request from disconnected WTP %s", wtp.addr)
             return
 
         sta = EtherAddress(request.sta)
@@ -375,7 +365,7 @@ class LVAPPConnection(object):
             shared_tenants = [x for x in RUNTIME.tenants.values()
                               if x.bssid_type == T_TYPE_SHARED]
 
-            wtp = RUNTIME.wtps[wtp_addr]
+            wtp = RUNTIME.wtps[wtp.addr]
 
             # look for bssid in shared tenants
             for tenant in shared_tenants:
@@ -394,7 +384,7 @@ class LVAPPConnection(object):
 
         self.send_auth_response(lvap)
 
-    def _handle_assoc_request(self, request):
+    def _handle_assoc_request(self, wtp, request):
         """Handle an incoming ASSOC_REQUEST message.
         Args:
             request, a ASSOC_REQUEST message
@@ -402,16 +392,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(request.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Assoc request from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("Assoc request from disconnected WTP %s", wtp_addr)
+            LOG.info("Assoc request from disconnected WTP %s", wtp.addr)
             return
 
         sta = EtherAddress(request.sta)
@@ -469,7 +451,7 @@ class LVAPPConnection(object):
     def _wait(self):
         """ Wait for incoming packets on signalling channel """
         self.__buffer = b''
-        self.stream.read_bytes(4, self._on_read)
+        self.stream.read_bytes(6, self._on_read)
 
     def _on_disconnect(self):
         """ Handle WTP disconnection """
@@ -485,9 +467,9 @@ class LVAPPConnection(object):
             dl_wtps = [block.radio for block in lvap.downlink.keys()]
             ul_wtps = [block.radio for block in lvap.uplink.keys()]
             # in case the downlink went down, the remove also the uplinks
-            if self.wtps in dl_wtps:
+            if self.wtp in dl_wtps:
                 RUNTIME.remove_lvap(lvap.addr)
-            elif self.wtps in ul_wtps:
+            elif self.wtp in ul_wtps:
                 LOG.info("Deleting LVAP (UL): %s", lvap.addr)
                 lvap.clear_uplink()
 
@@ -504,6 +486,7 @@ class LVAPPConnection(object):
         self.wtp.connection = None
         self.wtp.ports = {}
         self.wtp.supports = ResourcePool()
+        self.wtp = None
 
     def send_bye_message_to_self(self):
         """Send a unsollicited BYE message to senf."""
@@ -517,7 +500,7 @@ class LVAPPConnection(object):
         for handler in self.server.pt_types_handlers[PT_REGISTER]:
             handler(self.wtp)
 
-    def _handle_status_lvap(self, status):
+    def _handle_status_lvap(self, wtp, status):
         """Handle an incoming STATUS_LVAP message.
         Args:
             status, a STATUS_LVAP message
@@ -525,16 +508,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(status.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Status from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("Status from disconnected WTP %s", wtp_addr)
+            LOG.info("Status from disconnected WTP %s", wtp.addr)
             return
 
         sta_addr = EtherAddress(status.sta)
@@ -643,7 +618,7 @@ class LVAPPConnection(object):
         LOG.info("LVAP status %s", lvap)
 
     @classmethod
-    def _handle_status_port(cls, status):
+    def _handle_status_port(cls, wtp, status):
         """Handle an incoming PORT message.
         Args:
             status, a STATUS_PORT message
@@ -651,16 +626,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(status.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Status from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("Status from disconnected WTP %s", wtp_addr)
+            LOG.info("Status from disconnected WTP %s", wtp.addr)
             return
 
         sta_addr = EtherAddress(status.sta)
@@ -679,7 +646,7 @@ class LVAPPConnection(object):
 
         block = match.pop()
 
-        LOG.info("Port status from %s, station %s", wtp_addr, sta_addr)
+        LOG.info("Port status from %s, station %s", wtp.addr, sta_addr)
 
         tx_policy = block.tx_policies[sta_addr]
 
@@ -691,7 +658,7 @@ class LVAPPConnection(object):
 
         LOG.info("Port status %s", tx_policy)
 
-    def _handle_caps(self, caps):
+    def _handle_caps(self, wtp, caps):
         """Handle an incoming CAPS message.
         Args:
             caps, a CAPS message
@@ -699,15 +666,7 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(caps.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Caps response from unknown WTP (%s)", wtp_addr)
-            return
-
-        LOG.info("Received caps from %s", wtp_addr)
+        LOG.info("Received caps from %s", wtp.addr)
 
         for block in caps.blocks:
 
@@ -733,7 +692,7 @@ class LVAPPConnection(object):
             self.send_register_message_to_self()
 
     @classmethod
-    def _handle_interference_map(cls, interference_map):
+    def _handle_interference_map(cls, wtp, interference_map):
         """Handle an incoming INTERFERENCE_MAP message.
         Args:
             interference_map, an INTERFERENCE_MAP message
@@ -741,16 +700,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(interference_map.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("Status from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("Status from disconnected WTP %s", wtp_addr)
+            LOG.info("Status from disconnected WTP %s", wtp.addr)
             return
 
         LOG.info("Received interference map from %s", wtp.addr)
@@ -765,7 +716,7 @@ class LVAPPConnection(object):
                     block.rssi_to[sta] = entry[1]
 
     @classmethod
-    def _handle_status_vap(cls, status):
+    def _handle_status_vap(cls, wtp, status):
         """Handle an incoming STATUS_VAP message.
         Args:
             status, a STATUS_VAP message
@@ -773,16 +724,8 @@ class LVAPPConnection(object):
             None
         """
 
-        wtp_addr = EtherAddress(status.wtp)
-
-        try:
-            wtp = RUNTIME.wtps[wtp_addr]
-        except KeyError:
-            LOG.info("VAP Status from unknown WTP %s", wtp_addr)
-            return
-
         if not wtp.connection:
-            LOG.info("VAP Status from disconnected WTP %s", wtp_addr)
+            LOG.info("VAP Status from disconnected WTP %s", wtp.addr)
             return
 
         net_bssid_addr = EtherAddress(status.net_bssid)
@@ -827,7 +770,7 @@ class LVAPPConnection(object):
 
         add_vap = Container(version=PT_VERSION,
                             type=PT_ADD_VAP,
-                            length=22,
+                            length=24,
                             seq=self.wtp.seq,
                             hwaddr=vap.block.hwaddr.to_raw(),
                             channel=vap.block.channel,
@@ -853,7 +796,7 @@ class LVAPPConnection(object):
 
         response = Container(version=PT_VERSION,
                              type=PT_ASSOC_RESPONSE,
-                             length=14,
+                             length=16,
                              seq=self.wtp.seq,
                              sta=lvap.addr.to_raw())
 
@@ -872,7 +815,7 @@ class LVAPPConnection(object):
 
         response = Container(version=PT_VERSION,
                              type=PT_AUTH_RESPONSE,
-                             length=20,
+                             length=22,
                              seq=self.wtp.seq,
                              sta=lvap.addr.to_raw(),
                              bssid=lvap.lvap_bssid.to_raw())
@@ -892,7 +835,7 @@ class LVAPPConnection(object):
 
         response = Container(version=PT_VERSION,
                              type=PT_PROBE_RESPONSE,
-                             length=14,
+                             length=16,
                              seq=self.wtp.seq,
                              sta=lvap.addr.to_raw())
 
@@ -911,7 +854,7 @@ class LVAPPConnection(object):
 
         del_lvap = Container(version=PT_VERSION,
                              type=PT_DEL_LVAP,
-                             length=14,
+                             length=16,
                              seq=self.wtp.seq,
                              sta=lvap.addr.to_raw())
 
@@ -933,7 +876,7 @@ class LVAPPConnection(object):
 
         set_port = Container(version=PT_VERSION,
                              type=PT_SET_PORT,
-                             length=29 + len(rates),
+                             length=31 + len(rates),
                              seq=self.wtp.seq,
                              flags=flags,
                              sta=tx_policy.addr.to_raw(),
@@ -972,7 +915,7 @@ class LVAPPConnection(object):
 
         add_lvap = Container(version=PT_VERSION,
                              type=PT_ADD_LVAP,
-                             length=44,
+                             length=46,
                              seq=self.wtp.seq,
                              flags=flags,
                              assoc_id=lvap.assoc_id,

@@ -49,7 +49,7 @@ PT_DEL_SUMMARY = 0x24
 
 ADD_SUMMARY = Struct("add_summary", UBInt8("version"),
                      UBInt8("type"),
-                     UBInt16("length"),
+                     UBInt32("length"),
                      UBInt32("seq"),
                      UBInt32("module_id"),
                      Bytes("addr", 6),
@@ -76,7 +76,7 @@ SUMMARY_ENTRY = Sequence("frames",
 
 SUMMARY_TRIGGER = Struct("summary", UBInt8("version"),
                          UBInt8("type"),
-                         UBInt16("length"),
+                         UBInt32("length"),
                          UBInt32("seq"),
                          UBInt32("module_id"),
                          Bytes("wtp", 6),
@@ -85,7 +85,7 @@ SUMMARY_TRIGGER = Struct("summary", UBInt8("version"),
 
 DEL_SUMMARY = Struct("del_summary", UBInt8("version"),
                      UBInt8("type"),
-                     UBInt16("length"),
+                     UBInt32("length"),
                      UBInt32("seq"),
                      UBInt32("module_id"))
 
@@ -98,7 +98,7 @@ class Summary(ModuleTrigger):
 
     def __init__(self):
 
-        Module.__init__(self)
+        ModuleTrigger.__init__(self)
 
         # parameters
         self._addr = EtherAddress("FF:FF:FF:FF:FF:FF")
@@ -229,7 +229,7 @@ class Summary(ModuleTrigger):
 
         req = Container(version=PT_VERSION,
                         type=PT_ADD_SUMMARY,
-                        length=30,
+                        length=32,
                         seq=wtp.seq,
                         module_id=self.module_id,
                         limit=self.limit,
